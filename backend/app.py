@@ -1,129 +1,652 @@
 
-
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-from flask_sqlalchemy import SQLAlchemy
-from werkzeug.security import generate_password_hash, check_password_hash
-import jwt
 import os
+import re
+import logging
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit, unquote
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2.errors import UniqueViolation
+
+import jwt
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
+from dotenv import load_dotenv
+from google import genai
+
+
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+
+load_dotenv(dotenv_path=ENV_PATH, override=True)
 
 app = Flask(__name__)
-
 CORS(app)
 
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///medifind.db"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["SECRET_KEY"] = os.environ.get(
-    "MEDIFIND_SECRET_KEY", "dev-only-change-this-secret"
+app.config["SECRET_KEY"] = os.getenv("MEDIFIND_SECRET_KEY")
+print("SECRET KEY LOADED:", bool(app.config["SECRET_KEY"]))
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+# ---------------- GEMINI AI CONFIGURATION ----------------
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+gemini_client = (
+    genai.Client(api_key=GEMINI_API_KEY)
+    if GEMINI_API_KEY else None
 )
 
-db = SQLAlchemy(app)
+print("Gemini API key loaded:", bool(GEMINI_API_KEY))
+
+if len(DATABASE_URL) >= 2:
+    if DATABASE_URL[0] == DATABASE_URL[-1] and DATABASE_URL[0] in ("'", '"'):
+        DATABASE_URL = DATABASE_URL[1:-1].strip()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("MediFind")
+
+logger.info("Secret key loaded: %s", bool(app.config["SECRET_KEY"]))
 
 
-# USER DATABASE MODEL
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), nullable=False)
-    email = db.Column(db.String(120), unique=True, nullable=False)
-    password_hash = db.Column(db.String(255), nullable=False)
+# --------------------------------------------------
+# DATABASE CONNECTION
+# --------------------------------------------------
 
+def get_db():
 
-# HOME API
-@app.route("/")
-def home():
-    return jsonify({
-        "message": "Welcome to MediFind API",
-        "status": "Backend is running"
-    })
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is missing in backend/.env")
 
+    parsed = urlsplit(DATABASE_URL)
 
-# HEALTH CHECK
-@app.route("/api/health")
-def health():
-    return jsonify({
-        "status": "success",
-        "message": "MediFind Backend Connected"
-    })
+    if parsed.scheme.lower() not in ("postgresql", "postgres"):
+        raise ValueError("Invalid DATABASE_URL. Expected postgresql://")
 
+    db_user = unquote(parsed.username or "")
+    db_password = unquote(parsed.password or "")
+    db_host = parsed.hostname
+    db_name = unquote(parsed.path.lstrip("/")) or "postgres"
+    db_port = parsed.port or 5432
 
-# USER SIGNUP
-@app.route("/api/register", methods=["POST"])
-def register():
-    data = request.get_json(silent=True) or {}
+    if not all([db_user, db_password, db_host]):
+        raise ValueError("DATABASE_URL is incomplete.")
 
-    name = data.get("name", "").strip()
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "")
-
-    if not name or not email or not password:
-        return jsonify({"message": "All fields are required"}), 400
-
-    if "@" not in email:
-        return jsonify({"message": "Enter a valid email address"}), 400
-
-    if len(password) < 8:
-        return jsonify({
-            "message": "Password must contain at least 8 characters"
-        }), 400
-
-    existing_user = User.query.filter_by(email=email).first()
-
-    if existing_user:
-        return jsonify({"message": "Email already registered"}), 409
-
-    hashed_password = generate_password_hash(password)
-
-    new_user = User(
-        name=name,
-        email=email,
-        password_hash=hashed_password
+    logger.info(
+        "Connecting to PostgreSQL: host=%s port=%s user=%s",
+        db_host,
+        db_port,
+        db_user
     )
 
-    db.session.add(new_user)
-    db.session.commit()
+    conn = psycopg2.connect(
+        host=db_host,
+        port=db_port,
+        database=db_name,
+        user=db_user,
+        password=db_password,
+        sslmode="require",
+        connect_timeout=15,
+        cursor_factory=RealDictCursor
+    )
+
+    logger.info("PostgreSQL connection successful.")
+
+    return conn
+
+
+# --------------------------------------------------
+# DATABASE INITIALIZATION
+# --------------------------------------------------
+
+def initialize_database():
+
+    conn = get_db()
+
+    try:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    email TEXT NOT NULL UNIQUE,
+                    password TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pharmacies (
+                    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    pharmacy_name TEXT NOT NULL,
+                    location TEXT NOT NULL,
+                    phone TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS medicine_stock (
+                    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    pharmacy_id BIGINT NOT NULL
+                        REFERENCES pharmacies(id) ON DELETE CASCADE,
+                    medicine_name TEXT NOT NULL,
+                    quantity INTEGER NOT NULL DEFAULT 0
+                        CHECK (quantity >= 0),
+                    price NUMERIC(10,2),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_medicine_name
+                ON medicine_stock (LOWER(medicine_name))
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pharmacy_id
+                ON medicine_stock (pharmacy_id)
+            """)
+
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique
+                ON users (LOWER(email))
+            """)
+
+        conn.commit()
+
+        logger.info("Supabase PostgreSQL database initialized successfully.")
+
+    except Exception:
+        conn.rollback()
+        logger.exception("Database initialization failed")
+        raise
+
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------
+# VALIDATION
+# --------------------------------------------------
+
+def valid_email(email):
+
+    return bool(
+        re.fullmatch(
+            r"[^@\s]+@[^@\s]+\.[^@\s]+",
+            email
+        )
+    )
+
+
+# --------------------------------------------------
+# JWT TOKEN
+# --------------------------------------------------
+
+def create_token(user_id):
+
+    secret_key = app.config.get("SECRET_KEY")
+
+    if not secret_key:
+        raise RuntimeError(
+            "MEDIFIND_SECRET_KEY is missing in backend/.env"
+        )
+
+    payload = {
+        "user_id": user_id,
+        "exp": datetime.now(timezone.utc) + timedelta(days=1)
+    }
+
+    return jwt.encode(
+        payload,
+        secret_key,
+        algorithm="HS256"
+    )
+
+
+# --------------------------------------------------
+# HOME
+# --------------------------------------------------
+
+@app.route("/", methods=["GET"])
+def home():
 
     return jsonify({
         "status": "success",
-        "message": "Account created successfully"
-    }), 201
+        "message": "Welcome to MediFind API"
+    })
 
 
-# USER LOGIN
+# --------------------------------------------------
+# DATABASE TEST
+# --------------------------------------------------
+
+@app.route("/api/db-test", methods=["GET"])
+def db_test():
+
+    conn = None
+
+    try:
+        conn = get_db()
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT version() AS version")
+            result = cur.fetchone()
+
+        return jsonify({
+            "status": "success",
+            "message": "Database connection successful",
+            "database": result["version"]
+        })
+
+    except Exception:
+        logger.exception("Database test failed")
+
+        return jsonify({
+            "status": "error",
+            "message": "Database connection failed"
+        }), 500
+
+    finally:
+        if conn:
+            conn.close()
+
+
+# --------------------------------------------------
+# HEALTH CHECK
+# --------------------------------------------------
+
+@app.route("/api/health", methods=["GET"])
+def health():
+
+    conn = None
+
+    try:
+        conn = get_db()
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 AS result")
+            cur.fetchone()
+
+        return jsonify({
+            "status": "success",
+            "message": "MediFind backend is running"
+        })
+
+    except Exception:
+        logger.exception("Health check failed")
+
+        return jsonify({
+            "status": "error",
+            "message": "Backend health check failed"
+        }), 500
+
+    finally:
+        if conn:
+            conn.close()
+
+
+# --------------------------------------------------
+# REGISTER
+# --------------------------------------------------
+
+@app.route("/api/register", methods=["POST"])
+def register():
+
+    conn = None
+
+    try:
+        data = request.get_json(silent=True) or {}
+
+        name = str(data.get("name", "")).strip()
+        email = str(data.get("email", "")).strip().lower()
+        password = str(data.get("password", ""))
+
+        if not name or not email or not password:
+            return jsonify({
+                "status": "error",
+                "message": "All fields are required."
+            }), 400
+
+        if not valid_email(email):
+            return jsonify({
+                "status": "error",
+                "message": "Please enter a valid email address."
+            }), 400
+
+        if len(password) < 8:
+            return jsonify({
+                "status": "error",
+                "message": "Password must contain at least 8 characters."
+            }), 400
+
+        conn = get_db()
+
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                SELECT id
+                FROM users
+                WHERE LOWER(email) = %s
+                LIMIT 1
+            """, (email,))
+
+            existing_user = cur.fetchone()
+
+            if existing_user:
+                return jsonify({
+                    "status": "error",
+                    "message": "An account with this email already exists."
+                }), 409
+
+            hashed_password = generate_password_hash(password)
+
+            cur.execute("""
+                INSERT INTO users (name, email, password)
+                VALUES (%s, %s, %s)
+                RETURNING id
+            """, (
+                name,
+                email,
+                hashed_password
+            ))
+
+            new_user = cur.fetchone()
+
+        conn.commit()
+
+        return jsonify({
+            "status": "success",
+            "message": "Registration successful.",
+            "user_id": new_user["id"]
+        }), 201
+
+    except UniqueViolation:
+
+        if conn:
+            conn.rollback()
+
+        return jsonify({
+            "status": "error",
+            "message": "This email is already registered."
+        }), 409
+
+    except Exception:
+
+        if conn:
+            conn.rollback()
+
+        logger.exception("Registration failed")
+
+        return jsonify({
+            "status": "error",
+            "message": "Registration failed due to a server error."
+        }), 500
+
+    finally:
+        if conn:
+            conn.close()
+
+
+# --------------------------------------------------
+# LOGIN
+# --------------------------------------------------
+
 @app.route("/api/login", methods=["POST"])
 def login():
+
+    conn = None
+
+    try:
+        data = request.get_json(silent=True) or {}
+
+        email = str(data.get("email", "")).strip().lower()
+        password = str(data.get("password", ""))
+
+        if not email or not password:
+            return jsonify({
+                "status": "error",
+                "message": "Email and password are required."
+            }), 400
+
+        conn = get_db()
+
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                SELECT id, name, email, password
+                FROM users
+                WHERE LOWER(email) = %s
+                LIMIT 1
+            """, (email,))
+
+            account = cur.fetchone()
+
+        if not account:
+            return jsonify({
+                "status": "error",
+                "message": "No account found with this email."
+            }), 401
+
+        stored_password = account.get("password")
+
+        if not stored_password or not check_password_hash(
+            stored_password,
+            password
+        ):
+            return jsonify({
+                "status": "error",
+                "message": "Incorrect email or password."
+            }), 401
+
+        token = create_token(account["id"])
+
+        return jsonify({
+            "status": "success",
+            "message": "Login successful.",
+            "token": token,
+            "user": {
+                "id": account["id"],
+                "name": account["name"],
+                "email": account["email"]
+            }
+        }), 200
+
+    except Exception:
+
+        logger.exception("Login failed")
+
+        return jsonify({
+            "status": "error",
+            "message": "Login failed due to a server error."
+        }), 500
+
+    finally:
+        if conn:
+            conn.close()
+
+
+# --------------------------------------------------
+# PHARMACIES
+# --------------------------------------------------
+
+@app.route("/api/pharmacies", methods=["GET"])
+def get_pharmacies():
+
+    conn = None
+
+    try:
+        conn = get_db()
+
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                SELECT id, pharmacy_name, location, phone
+                FROM pharmacies
+                ORDER BY pharmacy_name
+            """)
+
+            pharmacies = cur.fetchall()
+
+        return jsonify({
+            "status": "success",
+            "pharmacies": pharmacies
+        })
+
+    except Exception:
+
+        logger.exception("Fetching pharmacies failed")
+
+        return jsonify({
+            "status": "error",
+            "message": "Unable to fetch pharmacies."
+        }), 500
+
+    finally:
+        if conn:
+            conn.close()
+
+
+# --------------------------------------------------
+# MEDICINE SEARCH
+# --------------------------------------------------
+
+@app.route("/api/medicines/search", methods=["GET"])
+def search_medicines():
+
+    conn = None
+
+    try:
+        medicine_name = request.args.get("name", "").strip()
+
+        if not medicine_name:
+            return jsonify({
+                "status": "error",
+                "message": "Please enter a medicine name."
+            }), 400
+
+        conn = get_db()
+
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                SELECT
+                    ms.id,
+                    ms.medicine_name,
+                    ms.quantity,
+                    ms.price,
+                    p.pharmacy_name,
+                    p.location,
+                    p.phone
+                FROM medicine_stock ms
+                JOIN pharmacies p
+                    ON ms.pharmacy_id = p.id
+                WHERE LOWER(ms.medicine_name)
+                    LIKE LOWER(%s)
+                    AND ms.quantity > 0
+                ORDER BY ms.medicine_name
+            """, (f"%{medicine_name}%",))
+
+            medicines = cur.fetchall()
+
+        return jsonify({
+            "status": "success",
+            "count": len(medicines),
+            "medicines": medicines
+        })
+
+    except Exception:
+
+        logger.exception("Medicine search failed")
+
+        return jsonify({
+            "status": "error",
+            "message": "Medicine search failed."
+        }), 500
+
+    finally:
+        if conn:
+            conn.close()
+
+
+# --------------------------------------------------
+# AI ASSISTANT PLACEHOLDER
+# --------------------------------------------------
+
+
+@app.route("/api/assistant", methods=["POST"])
+def assistant():
+
     data = request.get_json(silent=True) or {}
 
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "")
+    message = str(
+        data.get("question") or data.get("message") or ""
+    ).strip()
 
-    if not email or not password:
-        return jsonify({"message": "Email and password are required"}), 400
+    if not message:
+        return jsonify({
+            "status": "error",
+            "message": "Please enter a message."
+        }), 400
 
-    user = User.query.filter_by(email=email).first()
+    if not GEMINI_API_KEY:
+        return jsonify({
+            "status": "error",
+            "message": "Gemini API key missing."
+        }), 503
 
-    if not user or not check_password_hash(user.password_hash, password):
-        return jsonify({"message": "Invalid email or password"}), 401
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
 
-    token = jwt.encode({
-        "user_id": user.id,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=2)
-    }, app.config["SECRET_KEY"], algorithm="HS256")
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=message
+        )
 
-    return jsonify({
-        "status": "success",
-        "message": "Login successful",
-        "token": token,
-        "user": {
-            "id": user.id,
-            "name": user.name,
-            "email": user.email
-        }
-    }), 200
+        answer = (response.text or "").strip()
 
+        if not answer:
+            raise ValueError("Empty AI response")
+
+        return jsonify({
+            "status": "success",
+            "answer": answer,
+            "reply": answer
+        }), 200
+
+    except Exception:
+        logger.exception("Gemini Assistant error")
+
+        return jsonify({
+            "status": "error",
+            "message": "AI Assistant is temporarily unavailable."
+        }), 502
+
+
+# --------------------------------------------------
+# START SERVER
+# --------------------------------------------------
 
 if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
 
-    app.run(debug=True, port=5000)
+    try:
+        initialize_database()
+
+        logger.info("Starting MediFind backend...")
+
+        app.run(
+            host="127.0.0.1",
+            port=5000,
+            debug=True,
+            use_reloader=False
+        )
+
+    except Exception:
+        logger.exception("MediFind backend startup failed")
